@@ -18,6 +18,12 @@
 
 static const char *TAG = "wifi_sta";
 static int s_retry_count = 0;
+static volatile bool s_connected = false;
+
+bool wifi_sta_connected(void)
+{
+    return s_connected;
+}
 
 static const char *auth_mode_str(wifi_auth_mode_t mode)
 {
@@ -65,6 +71,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_connected = false;
         if (s_retry_count < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_retry_count++;
@@ -76,6 +83,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
         ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
+        s_connected = true;
     }
 }
 

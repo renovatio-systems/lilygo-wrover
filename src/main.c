@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 
 #include "ble_ring.h"
+#include "firetv.h"
 #include "wifi_sta.h"
 
 /* Onboard LED, per LilyGo T-Call (IP5306 variant) pin map */
@@ -74,6 +75,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(wifi_sta_start());
+    ESP_ERROR_CHECK(firetv_init());     /* before BLE: ring presses are queued to it */
     ESP_ERROR_CHECK(ble_ring_start());
 
     xTaskCreate(led_task, "led", 2048, NULL, 5, NULL);

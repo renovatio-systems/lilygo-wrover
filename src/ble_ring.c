@@ -1,15 +1,14 @@
 /*
  * BLE ring connector (ESP-IDF, Bluedroid).
  *
- * Scans for RING_NAME, connects as a GATT client, starts encryption with
- * legacy Just Works bonding (bonding ON, MITM OFF, SC OFF, IO cap NONE),
- * and reports the state via ble_ring_get_state().
- *
- * ESP-IDF calls the link-level encryption explicitly with
- * esp_ble_set_encryption() after the connection opens. Pairing is driven
- * by the GAP auth-complete event.
+ * Scans for a ring whose name starts with RING_NAME, connects as a GATT client,
+ * and bonds with legacy Just Works (bonding ON, MITM OFF, SC OFF, IO cap NONE).
+ * After pairing it discovers the ARCX service (0x1666), enables notifications on
+ * the Extended Key Event characteristic (0x1669), and maps button presses to Fire
+ * TV actions. GATT layout and key codes are the ones used by firetv_ctrl.
  */
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "esp_bt.h"
@@ -21,12 +20,45 @@
 #include "esp_log.h"
 
 #include "ble_ring.h"
+#include "firetv.h"
 #include "secrets.h"
 
 #define GATTC_APP_ID  0
 #define SCAN_SECONDS  0   /* 0 = scan until we stop it */
 
+#define ARCX_UUID_SERVICE        0x1666
+#define ARCX_UUID_EXT_KEY_EVENT  0x1669
+#define UUID_CCCD                0x2902
+
+/* Button states as sent by the ring (same numbering as firetv_ctrl). */
+typedef enum {
+    CENTER_PRESS = 0,
+    CENTER_RELEASE,
+    FORWARD_PRESS,
+    FORWARD_RELEASE,
+    BACKWARD_PRESS,
+    BACKWARD_RELEASE,
+    RIGHT_PRESS,    /* ids 6/7 are right, 8/9 left (observed; the overview doc has them swapped) */
+    RIGHT_RELEASE,
+    LEFT_PRESS,
+    LEFT_RELEASE,
+    SOS,
+} arcx_ring_state_t;
+
+static const char *const ARCX_STATE_NAMES[] = {
+    "CENTER_PRESS",   "CENTER_RELEASE", "FORWARD_PRESS", "FORWARD_RELEASE",
+    "BACKWARD_PRESS", "BACKWARD_RELEASE", "RIGHT_PRESS", "RIGHT_RELEASE",
+    "LEFT_PRESS",     "LEFT_RELEASE",   "SOS"};
+
 static const char *TAG = "ble_ring";
+
+typedef enum {
+    GATT_IDLE,
+    GATT_SEARCHING,    /* looking for the ARCX service */
+    GATT_REGISTERING,  /* registering for notifications on 0x1669 */
+    GATT_CCCD,         /* writing the CCCD to enable notifications */
+    GATT_READY,        /* notifications on; presses reach the Fire TV */
+} gatt_stage_t;
 
 static volatile ble_ring_state_t s_state = BLE_RING_SCANNING;
 static volatile bool s_ring_found = false;
@@ -35,20 +67,49 @@ static uint16_t s_conn_id = 0;
 static esp_bd_addr_t s_ring_addr;
 static esp_ble_addr_type_t s_ring_addr_type;
 
+static gatt_stage_t s_gatt_stage = GATT_IDLE;
+static bool s_srv_found = false;
+static uint16_t s_srv_start = 0, s_srv_end = 0;
+static uint16_t s_ext_handle = 0;
+
 ble_ring_state_t ble_ring_get_state(void)
 {
     return s_state;
+}
+
+/* 128-bit ARCX UUID: 00001666-1212-efde-1523-785feabcd124 (little endian). */
+static esp_bt_uuid_t arcx_uuid(uint16_t id)
+{
+    static const uint8_t base[16] = {0x24, 0xD1, 0xBC, 0xEA, 0x5F, 0x78, 0x23, 0x15,
+                                     0xDE, 0xEF, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00};
+    esp_bt_uuid_t u = {.len = ESP_UUID_LEN_128};
+    memcpy(u.uuid.uuid128, base, sizeof(base));
+    u.uuid.uuid128[12] = id & 0xFF;
+    u.uuid.uuid128[13] = id >> 8;
+    return u;
+}
+
+static esp_bt_uuid_t uuid16(uint16_t id)
+{
+    esp_bt_uuid_t u = {.len = ESP_UUID_LEN_16};
+    u.uuid.uuid16 = id;
+    return u;
+}
+
+static bool uuid_equal(const esp_bt_uuid_t *a, const esp_bt_uuid_t *b)
+{
+    return a->len == b->len && memcmp(&a->uuid, &b->uuid, a->len) == 0;
 }
 
 static void start_scan(void)
 {
     s_state = BLE_RING_SCANNING;
     esp_err_t err = esp_ble_gap_start_scanning(SCAN_SECONDS);
-    ESP_LOGI(TAG, "scanning for \"%s\" (%s)", RING_NAME, esp_err_to_name(err));
+    ESP_LOGI(TAG, "scanning for \"%s*\" (%s)", RING_NAME, esp_err_to_name(err));
 }
 
-/* True if the advertising data (adv + scan response) names the ring. */
-static bool name_matches(uint8_t *adv, uint16_t len)
+/* True if the advertised name (complete or short) starts with RING_NAME. */
+static bool name_matches(uint8_t *adv, uint16_t len, char *name_out, size_t name_out_size)
 {
     uint8_t name_len = 0;
     uint8_t *name = esp_ble_resolve_adv_data_by_type(adv, len, ESP_BLE_AD_TYPE_NAME_CMPL, &name_len);
@@ -58,7 +119,10 @@ static bool name_matches(uint8_t *adv, uint16_t len)
     if (name == NULL) {
         return false;
     }
-    return name_len == strlen(RING_NAME) && memcmp(name, RING_NAME, name_len) == 0;
+    size_t n = name_len < name_out_size - 1 ? name_len : name_out_size - 1;
+    memcpy(name_out, name, n);
+    name_out[n] = '\0';
+    return strncmp(name_out, RING_NAME, strlen(RING_NAME)) == 0;
 }
 
 static void set_security_params(void)
@@ -77,6 +141,44 @@ static void set_security_params(void)
     ESP_LOGI(TAG, "security: bonding ON, MITM OFF, SC OFF, IO cap NONE (Just Works), keys: enc+id");
 }
 
+static void on_key_event(const uint8_t *data, uint16_t len)
+{
+    if (len == 0 || data[0] > SOS) {
+        ESP_LOGW(TAG, "unknown key event len=%u", len);
+        return;
+    }
+    const char *action = NULL;
+    switch (data[0]) {
+    case CENTER_PRESS:   action = "select";     break;
+    case FORWARD_PRESS:  action = "dpad_up";    break;
+    case BACKWARD_PRESS: action = "dpad_down";  break;
+    case LEFT_PRESS:     action = "dpad_left";  break;
+    case RIGHT_PRESS:    action = "dpad_right"; break;
+    case SOS:            action = "home";       break;
+    default: break;   /* releases are ignored */
+    }
+    ESP_LOGI(TAG, "key %s", ARCX_STATE_NAMES[data[0]]);
+    if (action) {
+        firetv_queue_action(action);
+    }
+}
+
+/* Step 1 of GATT setup, after pairing: find the ARCX service. */
+static void gatt_start(void)
+{
+    s_gatt_stage = GATT_SEARCHING;
+    s_srv_found = false;
+    esp_bt_uuid_t svc = arcx_uuid(ARCX_UUID_SERVICE);
+    esp_ble_gattc_search_service(s_gattc_if, s_conn_id, &svc);
+}
+
+static void gatt_fail(const char *what)
+{
+    ESP_LOGE(TAG, "%s; giving up on this connection", what);
+    s_gatt_stage = GATT_IDLE;
+    esp_ble_gattc_close(s_gattc_if, s_conn_id);
+}
+
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
@@ -89,10 +191,11 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         if (r->search_evt != ESP_GAP_SEARCH_INQ_RES_EVT || s_ring_found || s_state != BLE_RING_SCANNING) {
             break;
         }
+        char name[32];
         uint16_t len = r->adv_data_len + r->scan_rsp_len;
-        if (name_matches(r->ble_adv, len)) {
+        if (name_matches(r->ble_adv, len, name, sizeof(name))) {
             ESP_LOGI(TAG, "found \"%s\" addr=" ESP_BD_ADDR_STR " rssi=%d",
-                     RING_NAME, ESP_BD_ADDR_HEX(r->bda), r->rssi);
+                     name, ESP_BD_ADDR_HEX(r->bda), r->rssi);
             memcpy(s_ring_addr, r->bda, sizeof(esp_bd_addr_t));
             s_ring_addr_type = r->ble_addr_type;
             s_ring_found = true;
@@ -147,6 +250,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             ESP_LOGI(TAG, "[sec]   auth_mode=0x%02x key_present=%d key_type=%d",
                      auth->auth_mode, auth->key_present, auth->key_type);
             ESP_LOGI(TAG, "paired - LED solid");
+            gatt_start();
         } else {
             ESP_LOGE(TAG, "[sec] auth complete: FAILED  addr=" ESP_BD_ADDR_STR " fail_reason=0x%02x",
                      ESP_BD_ADDR_HEX(auth->bd_addr), auth->fail_reason);
@@ -172,7 +276,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         s_gattc_if = gattc_if;
         break;
 
-    case ESP_GATTC_OPEN_EVT:
+    case ESP_GATTC_OPEN_EVT: {
         if (param->open.status != ESP_GATT_OK) {
             ESP_LOGE(TAG, "connect failed, status=%d", param->open.status);
             start_scan();
@@ -188,9 +292,90 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             esp_ble_gattc_close(gattc_if, s_conn_id);
         }
         break;
+    }
+
+    case ESP_GATTC_SEARCH_RES_EVT: {
+        esp_bt_uuid_t svc = arcx_uuid(ARCX_UUID_SERVICE);
+        if (!s_srv_found && uuid_equal(&param->search_res.srvc_id.uuid, &svc)) {
+            s_srv_found = true;
+            s_srv_start = param->search_res.start_handle;
+            s_srv_end = param->search_res.end_handle;
+        }
+        break;
+    }
+
+    case ESP_GATTC_SEARCH_CMPL_EVT: {
+        if (s_gatt_stage != GATT_SEARCHING) {
+            break;
+        }
+        if (!s_srv_found) {
+            gatt_fail("ARCX service (0x1666) not found");
+            break;
+        }
+        ESP_LOGI(TAG, "ARCX service handles 0x%04x-0x%04x", s_srv_start, s_srv_end);
+
+        esp_bt_uuid_t ext = arcx_uuid(ARCX_UUID_EXT_KEY_EVENT);
+        esp_gattc_char_elem_t ch;
+        uint16_t count = 1;
+        esp_gatt_status_t st = esp_ble_gattc_get_char_by_uuid(gattc_if, s_conn_id,
+                                                              s_srv_start, s_srv_end, ext,
+                                                              &ch, &count);
+        if (st != ESP_GATT_OK || count == 0) {
+            gatt_fail("Extended Key Event characteristic (0x1669) not found");
+            break;
+        }
+        s_ext_handle = ch.char_handle;
+        s_gatt_stage = GATT_REGISTERING;
+        esp_ble_gattc_register_for_notify(gattc_if, s_ring_addr, s_ext_handle);
+        break;
+    }
+
+    case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
+        if (s_gatt_stage != GATT_REGISTERING) {
+            break;
+        }
+        if (param->reg_for_notify.status != ESP_GATT_OK) {
+            gatt_fail("register for notify failed");
+            break;
+        }
+        /* Find the CCCD on the key-event characteristic and enable notifications. */
+        esp_bt_uuid_t cccd = uuid16(UUID_CCCD);
+        esp_gattc_descr_elem_t d;
+        uint16_t dcount = 1;
+        esp_gatt_status_t st = esp_ble_gattc_get_descr_by_char_handle(gattc_if, s_conn_id,
+                                                                      s_ext_handle, cccd, &d, &dcount);
+        if (st != ESP_GATT_OK || dcount == 0) {
+            gatt_fail("CCCD not found on key-event characteristic");
+            break;
+        }
+        uint8_t value[2] = {0x01, 0x00};   /* notifications on */
+        s_gatt_stage = GATT_CCCD;
+        esp_ble_gattc_write_char_descr(gattc_if, s_conn_id, d.handle, sizeof(value), value,
+                                       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+        break;
+    }
+
+    case ESP_GATTC_WRITE_DESCR_EVT:
+        if (s_gatt_stage != GATT_CCCD) {
+            break;
+        }
+        if (param->write.status != ESP_GATT_OK) {
+            gatt_fail("enabling notifications failed");
+            break;
+        }
+        s_gatt_stage = GATT_READY;
+        ESP_LOGI(TAG, "notifications enabled; press the ring");
+        break;
+
+    case ESP_GATTC_NOTIFY_EVT:
+        if (s_gatt_stage == GATT_READY && param->notify.handle == s_ext_handle) {
+            on_key_event(param->notify.value, param->notify.value_len);
+        }
+        break;
 
     case ESP_GATTC_DISCONNECT_EVT:
         ESP_LOGW(TAG, "disconnected, reason=0x%x", param->disconnect.reason);
+        s_gatt_stage = GATT_IDLE;
         start_scan();
         break;
 

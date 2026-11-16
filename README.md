@@ -1,11 +1,25 @@
 # LilyGo T-Call: WiFi station + BLE ring connector
 
 ESP-IDF firmware for the LilyGo T-Call board (ESP32-WROVER-B, 4 MB flash).
-At boot it does two things at once:
+At boot it does three things at once:
 
 - **WiFi:** scans and logs visible SSIDs, then connects to `WIFI_SSID` with retries.
-- **BLE:** scans for a ring advertising as `RING_NAME`, connects, and bonds with it
-  (legacy Just Works: bonding ON, MITM OFF, Secure Connections OFF).
+- **BLE:** scans for a ring whose name starts with `RING_NAME`, connects, and bonds
+  with it (legacy Just Works: bonding ON, MITM OFF, Secure Connections OFF).
+- **Fire TV:** once the ring is bonded, it subscribes to the ring's key-event
+  notifications (ARCX service 0x1666, characteristic 0x1669) and sends the matching
+  remote key to the Fire TV at `FIRETV_HOST`.
+
+Ring buttons (Fire TV mode):
+
+| Button    | Fire TV key |
+|-----------|-------------|
+| center    | select      |
+| forward   | dpad up     |
+| backward  | dpad down   |
+| left      | dpad left   |
+| right     | dpad right  |
+| SOS       | home        |
 
 The onboard blue LED (GPIO13) shows the BLE ring state:
 
@@ -42,7 +56,13 @@ cp src/secrets.h.example src/secrets.h
 
 Edit `src/secrets.h`:
 - `WIFI_SSID`, `WIFI_PASSWORD`: your network.
-- `RING_NAME`: the ring's advertised name.
+- `RING_NAME`: the ring's advertised name (prefix match).
+- `FIRETV_HOST`: the Fire TV's IP address.
+
+The Fire TV must be paired once. On first boot without a stored token, the firmware
+asks for the PIN shown on the TV. Type it into the serial console when prompted
+(`Enter the PIN shown on the TV:`). The token is saved in NVS. To pair again,
+erase the flash (`pio run -t erase`) and reflash.
 
 ## Build and flash
 
@@ -60,6 +80,14 @@ Find the serial port with `~/.venvs/platformio/bin/pio device list`. The board's
 USB-UART is a CP2104 (`10C4:EA60`).
 
 Close any terminal program on the port (`screen`, `picocom`, `microcom`) before flashing.
+
+## Security note
+
+The Fire TV API uses a self-signed HTTPS certificate on port 8080. Certificate
+verification is turned off for all TLS in this firmware
+(`CONFIG_ESP_TLS_INSECURE` and `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY` in
+`sdkconfig.defaults`). Anyone on the network can impersonate the TV. Only use this
+on a network you trust.
 
 ## View the console log
 
@@ -108,6 +136,7 @@ src/
   CMakeLists.txt      component registration
   main.c              app_main, LED state
   wifi_sta.c/.h       WiFi station: scan and connect
-  ble_ring.c/.h       BLE scan, connect, bond
+  ble_ring.c/.h       BLE scan, bond, ARCX GATT, key events
+  firetv.c/.h         Fire TV remote client (HTTPS, PIN pairing, NVS token)
   secrets.h.example   template for src/secrets.h (gitignored)
 ```
