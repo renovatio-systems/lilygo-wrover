@@ -47,6 +47,15 @@ cd ble_ring
 ~/.venvs/platformio/bin/pio run
 ```
 
+### Target device name
+
+The firmware defaults to `arcxp-1234`. To target a different ring, pass its
+advertised name at build time. Don't put the real name in any tracked file:
+
+```
+PLATFORMIO_BUILD_FLAGS='-DTARGET_NAME=\"<advertised-name>\"' ~/.venvs/platformio/bin/pio run
+```
+
 ## Find the serial port
 
 ```

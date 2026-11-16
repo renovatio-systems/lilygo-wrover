@@ -15,7 +15,11 @@
 #include <BLEAdvertisedDevice.h>
 #include <BLESecurity.h>
 
-static const char *TARGET_NAME = "arcxp-1234";
+// Override at build time without committing it, e.g.:
+//   PLATFORMIO_BUILD_FLAGS='-DTARGET_NAME="<name>"' pio run
+#ifndef TARGET_NAME
+#define TARGET_NAME "arcxp-1234"
+#endif
 static const uint8_t LED_PIN = 13;
 
 enum LedState : uint8_t { SCANNING, CONNECTING, PAIRED };
