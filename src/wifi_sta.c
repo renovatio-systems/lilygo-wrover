@@ -25,7 +25,7 @@ bool wifi_sta_connected(void)
     return s_connected;
 }
 
-static const char *auth_mode_str(wifi_auth_mode_t mode)
+__attribute__((unused)) static const char *auth_mode_str(wifi_auth_mode_t mode)
 {
     switch (mode) {
     case WIFI_AUTH_OPEN:            return "OPEN";
@@ -57,12 +57,7 @@ static void scan_and_log_networks(void)
 
     ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_records));
 
-    ESP_LOGI(TAG, "found %u SSID(s):", ap_count);
-    for (int i = 0; i < ap_count; i++) {
-        ESP_LOGI(TAG, "  [%2d] %-32s RSSI:%4d ch:%2d auth:%s",
-                 i, (const char *) ap_records[i].ssid, ap_records[i].rssi,
-                 ap_records[i].primary, auth_mode_str(ap_records[i].authmode));
-    }
+    /* Scan results are not printed: they would show neighbours' SSIDs. */
 
     free(ap_records);
 }
@@ -77,11 +72,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             s_retry_count++;
             ESP_LOGI(TAG, "retrying connection to AP (%d/%d)", s_retry_count, WIFI_MAX_RETRY);
         } else {
-            ESP_LOGE(TAG, "failed to connect to SSID:%s after %d retries", WIFI_SSID, WIFI_MAX_RETRY);
+            ESP_LOGE(TAG, "failed to connect to WiFi after %d retries", WIFI_MAX_RETRY);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&event->ip_info.ip));
+        (void) event;
+        ESP_LOGI(TAG, "connected to WiFi");
         s_retry_count = 0;
         s_connected = true;
     }
@@ -115,6 +111,6 @@ esp_err_t wifi_sta_start(void)
 
     scan_and_log_networks();
 
-    ESP_LOGI(TAG, "connecting to SSID:%s", WIFI_SSID);
+    ESP_LOGI(TAG, "connecting to WiFi");
     return esp_wifi_connect();
 }

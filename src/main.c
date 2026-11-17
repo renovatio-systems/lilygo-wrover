@@ -65,6 +65,11 @@ static void led_task(void *arg)
 
 void app_main(void)
 {
+    /* The IDF WiFi/netif drivers print the SSID, IP and gateway at INFO level.
+     * Keep those off the console so recordings do not show them. */
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+
     led_init();
 
     esp_err_t ret = nvs_flash_init();

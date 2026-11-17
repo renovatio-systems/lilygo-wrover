@@ -87,7 +87,7 @@ static int ctl_request(const char *url, const char *body, char *err, size_t err_
         return -1;
     }
     if (status < 200 || status >= 300) {
-        snprintf(err, err_size, "HTTP %d from %s", status, url);
+        snprintf(err, err_size, "HTTP %d from Fire TV", status);
         ctl_reset();
         return -1;
     }
@@ -105,7 +105,7 @@ static int http_request(const char *method, const char *url, const char *token,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
-        snprintf(err, err_size, "http client init failed for %s", url);
+        snprintf(err, err_size, "http client init failed");
         return -1;
     }
 
@@ -122,12 +122,12 @@ static int http_request(const char *method, const char *url, const char *token,
     }
 
     if (esp_http_client_open(client, body_len) != ESP_OK) {
-        snprintf(err, err_size, "no response from %s (is the TV awake?)", url);
+        snprintf(err, err_size, "no response from Fire TV (is the TV awake?)");
         esp_http_client_cleanup(client);
         return -1;
     }
     if (body_len > 0 && esp_http_client_write(client, body, body_len) < 0) {
-        snprintf(err, err_size, "write failed to %s", url);
+        snprintf(err, err_size, "write failed to Fire TV");
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return -1;
@@ -145,7 +145,7 @@ static int http_request(const char *method, const char *url, const char *token,
         snprintf(resp, resp_size, "%s", buf);
     }
     if (status < 200 || status >= 300) {
-        snprintf(err, err_size, "HTTP %d from %s: %.200s", status, url, buf);
+        snprintf(err, err_size, "HTTP %d from Fire TV: %.200s", status, buf);
         return -1;
     }
     return 0;
@@ -284,7 +284,7 @@ static void pair_interactive(void)
 {
     char err[ERR_MAX], pin[16], token[TOKEN_MAX];
 
-    ESP_LOGI(TAG, "no token stored; pairing with Fire TV at %s", FIRETV_HOST);
+    ESP_LOGI(TAG, "no token stored; pairing with Fire TV");
     ftv_wake(err, sizeof(err));   /* best effort; the port may already be open */
 
     /* The remote service can take a few seconds to start listening after wake. */
@@ -368,4 +368,9 @@ void firetv_queue_action(const char *action)
 {
     /* Dropped if the queue is full; BLE callbacks must not block. */
     xQueueSend(s_queue, &action, 0);
+}
+
+bool firetv_idle(void)
+{
+    return s_queue && uxQueueMessagesWaiting(s_queue) == 0;
 }

@@ -18,6 +18,7 @@
 #include "esp_gatt_defs.h"
 #include "esp_gattc_api.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "ble_ring.h"
 #include "firetv.h"
@@ -105,7 +106,7 @@ static void start_scan(void)
 {
     s_state = BLE_RING_SCANNING;
     esp_err_t err = esp_ble_gap_start_scanning(SCAN_SECONDS);
-    ESP_LOGI(TAG, "scanning for \"%s*\" (%s)", RING_NAME, esp_err_to_name(err));
+    ESP_LOGI(TAG, "scanning for ArcX Pro (%s)", esp_err_to_name(err));
 }
 
 /* True if the advertised name (complete or short) starts with RING_NAME. */
@@ -141,25 +142,99 @@ static void set_security_params(void)
     ESP_LOGI(TAG, "security: bonding ON, MITM OFF, SC OFF, IO cap NONE (Just Works), keys: enc+id");
 }
 
+/* Press and hold. The ring only reports press and release, so a hold is detected
+ * with a timer: if the button is still down after HOLD_MS the hold action is sent,
+ * then repeated every REPEAT_MS until release. A release before HOLD_MS is a short
+ * press and sends the normal action then (so a short press is sent on release). */
+#define HOLD_MS    400
+#define REPEAT_MS  200
+
+typedef struct {
+    int         press;      /* arcx_ring_state_t press value, release is press + 1 */
+    const char *tap;        /* sent on a short press */
+    const char *hold;       /* sent repeatedly while held */
+} key_map_t;
+
+static const key_map_t KEY_MAP[] = {
+    { CENTER_PRESS,   "select",     "back"        },
+    { FORWARD_PRESS,  "dpad_up",    "volume_up"   },
+    { BACKWARD_PRESS, "dpad_down",  "volume_down" },
+    { LEFT_PRESS,     "dpad_left",  "scan_back"   },
+    { RIGHT_PRESS,    "dpad_right", "scan_forward" },
+};
+
+static const key_map_t *volatile s_held;       /* button currently down, or NULL */
+static volatile bool s_hold_active;            /* hold timer fired, repeating */
+static esp_timer_handle_t s_hold_timer, s_repeat_timer;
+
+static void hold_stop(void)
+{
+    esp_timer_stop(s_hold_timer);
+    esp_timer_stop(s_repeat_timer);
+    s_held = NULL;
+    s_hold_active = false;
+}
+
+static void repeat_cb(void *arg)
+{
+    const key_map_t *k = s_held;
+    /* Skip a tick if the Fire TV task is still busy, so nothing queues up and
+     * keeps firing after the button is released. */
+    if (k && firetv_idle()) {
+        firetv_queue_action(k->hold);
+    }
+}
+
+static void hold_cb(void *arg)
+{
+    const key_map_t *k = s_held;
+    if (!k) {
+        return;
+    }
+    s_hold_active = true;
+    ESP_LOGI(TAG, "hold %s", k->hold);
+    firetv_queue_action(k->hold);
+    esp_timer_start_periodic(s_repeat_timer, REPEAT_MS * 1000);
+}
+
+static void hold_init(void)
+{
+    const esp_timer_create_args_t a = { .callback = hold_cb, .name = "ring_hold" };
+    const esp_timer_create_args_t b = { .callback = repeat_cb, .name = "ring_repeat" };
+    ESP_ERROR_CHECK(esp_timer_create(&a, &s_hold_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&b, &s_repeat_timer));
+}
+
 static void on_key_event(const uint8_t *data, uint16_t len)
 {
     if (len == 0 || data[0] > SOS) {
         ESP_LOGW(TAG, "unknown key event len=%u", len);
         return;
     }
-    const char *action = NULL;
-    switch (data[0]) {
-    case CENTER_PRESS:   action = "select";     break;
-    case FORWARD_PRESS:  action = "dpad_up";    break;
-    case BACKWARD_PRESS: action = "dpad_down";  break;
-    case LEFT_PRESS:     action = "dpad_left";  break;
-    case RIGHT_PRESS:    action = "dpad_right"; break;
-    case SOS:            action = "home";       break;
-    default: break;   /* releases are ignored */
+    uint8_t ev = data[0];
+    ESP_LOGI(TAG, "key %s", ARCX_STATE_NAMES[ev]);
+
+    if (ev == SOS) {
+        hold_stop();
+        firetv_queue_action("home");
+        return;
     }
-    ESP_LOGI(TAG, "key %s", ARCX_STATE_NAMES[data[0]]);
-    if (action) {
-        firetv_queue_action(action);
+    for (size_t i = 0; i < sizeof(KEY_MAP) / sizeof(KEY_MAP[0]); i++) {
+        const key_map_t *k = &KEY_MAP[i];
+        if (ev == k->press) {
+            hold_stop();                      /* one button at a time */
+            s_held = k;
+            esp_timer_start_once(s_hold_timer, HOLD_MS * 1000);
+            return;
+        }
+        if (ev == k->press + 1 && s_held == k) {
+            bool was_hold = s_hold_active;
+            hold_stop();
+            if (!was_hold) {
+                firetv_queue_action(k->tap);
+            }
+            return;
+        }
     }
 }
 
@@ -194,8 +269,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         char name[32];
         uint16_t len = r->adv_data_len + r->scan_rsp_len;
         if (name_matches(r->ble_adv, len, name, sizeof(name))) {
-            ESP_LOGI(TAG, "found \"%s\" addr=" ESP_BD_ADDR_STR " rssi=%d",
-                     name, ESP_BD_ADDR_HEX(r->bda), r->rssi);
+            ESP_LOGI(TAG, "found ArcX Pro, rssi=%d", r->rssi);
             memcpy(s_ring_addr, r->bda, sizeof(esp_bd_addr_t));
             s_ring_addr_type = r->ble_addr_type;
             s_ring_found = true;
@@ -208,7 +282,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         if (s_ring_found) {
             s_ring_found = false;
             s_state = BLE_RING_CONNECTING;
-            ESP_LOGI(TAG, "connecting to " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(s_ring_addr));
+            ESP_LOGI(TAG, "Connect to ArcX Pro");
             esp_err_t err = esp_ble_gattc_open(s_gattc_if, s_ring_addr, s_ring_addr_type, true);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ble_gattc_open() failed: %s", esp_err_to_name(err));
@@ -246,14 +320,13 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         esp_ble_auth_cmpl_t *auth = &param->ble_security.auth_cmpl;
         if (auth->success) {
             s_state = BLE_RING_PAIRED;
-            ESP_LOGI(TAG, "[sec] auth complete: OK  addr=" ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(auth->bd_addr));
+            ESP_LOGI(TAG, "[sec] auth complete: OK");
             ESP_LOGI(TAG, "[sec]   auth_mode=0x%02x key_present=%d key_type=%d",
                      auth->auth_mode, auth->key_present, auth->key_type);
             ESP_LOGI(TAG, "paired - LED solid");
             gatt_start();
         } else {
-            ESP_LOGE(TAG, "[sec] auth complete: FAILED  addr=" ESP_BD_ADDR_STR " fail_reason=0x%02x",
-                     ESP_BD_ADDR_HEX(auth->bd_addr), auth->fail_reason);
+            ESP_LOGE(TAG, "[sec] auth complete: FAILED fail_reason=0x%02x", auth->fail_reason);
             esp_ble_gattc_close(s_gattc_if, s_conn_id);   /* disconnect event restarts the scan */
         }
         break;
@@ -375,6 +448,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 
     case ESP_GATTC_DISCONNECT_EVT:
         ESP_LOGW(TAG, "disconnected, reason=0x%x", param->disconnect.reason);
+        hold_stop();   /* never keep repeating a key after the ring drops */
         s_gatt_stage = GATT_IDLE;
         start_scan();
         break;
@@ -386,6 +460,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 
 esp_err_t ble_ring_start(void)
 {
+    hold_init();
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
