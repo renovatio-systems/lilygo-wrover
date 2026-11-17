@@ -12,6 +12,8 @@
 
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "driver/uart.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -37,6 +39,61 @@ static bool          s_have_token = false;
 
 /* Sends one request. Returns 0 on HTTP 2xx, -1 otherwise. The response body (if any)
  * is copied to resp; err gets a message on failure. */
+/* Persistent client for authenticated control requests. Reusing it keeps the TLS
+ * session open between key presses, so only the first press (or the first one
+ * after the TV closes the idle connection) pays for a TLS handshake. */
+static esp_http_client_handle_t s_ctl;
+
+static void ctl_reset(void)
+{
+    if (s_ctl) {
+        esp_http_client_cleanup(s_ctl);
+        s_ctl = NULL;
+    }
+}
+
+static int ctl_request(const char *url, const char *body, char *err, size_t err_size)
+{
+    if (!s_ctl) {
+        esp_http_client_config_t cfg = {
+            .url = url,
+            .timeout_ms = 5000,
+            .keep_alive_enable = true,
+            .skip_cert_common_name_check = true,
+        };
+        s_ctl = esp_http_client_init(&cfg);
+        if (!s_ctl) {
+            snprintf(err, err_size, "http client init failed");
+            return -1;
+        }
+        esp_http_client_set_header(s_ctl, "X-Api-Key", API_KEY);
+        esp_http_client_set_header(s_ctl, "user-agent", "okhttp/4.10.0");
+        esp_http_client_set_header(s_ctl, "X-Client-Token", s_token);
+    }
+    esp_http_client_set_url(s_ctl, url);
+    esp_http_client_set_method(s_ctl, HTTP_METHOD_POST);
+    if (body) {
+        esp_http_client_set_header(s_ctl, "Content-Type", "application/json; charset=utf-8");
+        esp_http_client_set_post_field(s_ctl, body, (int) strlen(body));
+    } else {
+        esp_http_client_delete_header(s_ctl, "Content-Type");
+        esp_http_client_set_post_field(s_ctl, NULL, 0);
+    }
+    esp_err_t e = esp_http_client_perform(s_ctl);
+    int status = esp_http_client_get_status_code(s_ctl);
+    if (e != ESP_OK) {
+        snprintf(err, err_size, "request failed: %s", esp_err_to_name(e));
+        ctl_reset();   /* connection is stale; next call reconnects */
+        return -1;
+    }
+    if (status < 200 || status >= 300) {
+        snprintf(err, err_size, "HTTP %d from %s", status, url);
+        ctl_reset();
+        return -1;
+    }
+    return 0;
+}
+
 static int http_request(const char *method, const char *url, const char *token,
                         const char *body, char *resp, size_t resp_size,
                         char *err, size_t err_size)
@@ -138,17 +195,17 @@ static int ftv_send(const char *action, char *err, size_t err_size)
 
     if (strcmp(action, "play") == 0) {
         snprintf(url, sizeof(url), "https://%s:8080/v1/media?action=play", FIRETV_HOST);
-        return http_request("POST", url, s_token, NULL, NULL, 0, err, err_size);
+        return ctl_request(url, NULL, err, err_size);
     }
     if (strcmp(action, "scan_forward") == 0 || strcmp(action, "scan_back") == 0) {
         snprintf(url, sizeof(url), "https://%s:8080/v1/media?action=scan", FIRETV_HOST);
         const char *body = strcmp(action, "scan_forward") == 0
             ? "{\"direction\":\"forward\",\"keyAction\":{\"keyActionType\":\"keyDown\"}}"
             : "{\"direction\":\"back\",\"keyAction\":{\"keyActionType\":\"keyDown\"}}";
-        return http_request("POST", url, s_token, body, NULL, 0, err, err_size);
+        return ctl_request(url, body, err, err_size);
     }
     snprintf(url, sizeof(url), "https://%s:8080/v1/FireTV?action=%s", FIRETV_HOST, action);
-    return http_request("POST", url, s_token, NULL, NULL, 0, err, err_size);
+    return ctl_request(url, NULL, err, err_size);
 }
 
 /* ---- token storage (NVS) ---- */
@@ -182,6 +239,47 @@ static esp_err_t token_save(const char *token)
 
 /* ---- pairing: PIN is typed on the serial console ---- */
 
+/* Read a line straight from the console UART. stdin/fgets returns EOF at once
+ * when the UART driver is not installed, so install it and echo characters
+ * ourselves (terminals like picocom do not echo locally). Accepts CR or LF. */
+static int console_read_line(const char *prompt, char *buf, size_t size)
+{
+    const uart_port_t port = CONFIG_ESP_CONSOLE_UART_NUM;
+    size_t n = 0;
+
+    if (!uart_is_driver_installed(port) &&
+        uart_driver_install(port, 256, 0, 0, NULL, 0) != ESP_OK) {
+        return -1;
+    }
+    uart_flush_input(port);
+    printf("\r\n%s", prompt);
+    fflush(stdout);
+
+    for (;;) {
+        uint8_t c;
+        if (uart_read_bytes(port, &c, 1, portMAX_DELAY) != 1) {
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            if (n > 0) {
+                break;
+            }
+            continue;   /* ignore empty lines / the LF of a CRLF */
+        }
+        if ((c == 0x7f || c == '\b') && n > 0) {
+            n--;
+            printf("\b \b");
+        } else if (c >= ' ' && c < 0x7f && n + 1 < size) {
+            buf[n++] = (char)c;
+            putchar(c);
+        }
+        fflush(stdout);
+    }
+    buf[n] = '\0';
+    printf("\r\n");
+    return (int)n;
+}
+
 static void pair_interactive(void)
 {
     char err[ERR_MAX], pin[16], token[TOKEN_MAX];
@@ -200,13 +298,10 @@ static void pair_interactive(void)
         return;
     }
 
-    printf("Enter the PIN shown on the TV: ");
-    fflush(stdout);
-    if (!fgets(pin, sizeof(pin), stdin)) {
+    if (console_read_line("Enter the PIN shown on the TV: ", pin, sizeof(pin)) <= 0) {
         ESP_LOGE(TAG, "no PIN entered");
         return;
     }
-    pin[strcspn(pin, "\r\n")] = '\0';
 
     if (ftv_pin_verify(pin, token, sizeof(token), err, sizeof(err)) != 0) {
         ESP_LOGE(TAG, "pairing failed: %s", err);
